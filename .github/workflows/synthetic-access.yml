@@ -1,0 +1,56 @@
+name: Synthetic access check
+on: workflow_dispatch
+permissions:
+  contents: write
+jobs:
+  verify:
+    if: github.repository == 'Kolfetgee/orion-opt-01-free-pilot' && github.ref == 'refs/heads/main' && github.run_attempt == 1
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Verify fixed synthetic operations
+        shell: python
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          import base64, json, os, urllib.request, urllib.error
+          base = 'https://api.github.com/repos/Kolfetgee/orion-opt-01-free-pilot/'
+          def call(method, path, body=None):
+              data = None if body is None else json.dumps(body).encode()
+              req = urllib.request.Request(base + path, data=data, method=method, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Content-Type': 'application/json'})
+              try:
+                  with urllib.request.urlopen(req, timeout=12) as response:
+                      return response.status, json.load(response)
+              except urllib.error.HTTPError as err:
+                  return err.code, json.load(err)
+          def ref(name):
+              status, body = call('GET', 'git/ref/' + name)
+              assert status == 200, (name, status)
+              return body['object']['sha']
+          def put(branch, path, content):
+              return call('PUT', 'contents/' + path, {'message':'Synthetic preflight check','branch':branch,'content':base64.b64encode(content.encode()).decode()})
+          def denied(label, result):
+              code, body = result
+              print(label, code, body.get('message',''), flush=True)
+              assert code in (403, 409, 422) and any(s in json.dumps(body).lower() for s in ('rule','protected','permission','accessible','workflow scope','workflows permission')), label
+          main = ref('heads/main')
+          data = ref('heads/transport-state')
+          print('before', main, data)
+          marker = 'synthetic-' + os.environ['GITHUB_RUN_ID'] + '.txt'
+          status, body = put('transport-state', marker, 'synthetic only\n')
+          assert status == 201, (status, body.get('message'))
+          after = ref('heads/transport-state')
+          assert after == body['commit']['sha'] and data != after
+          print('data write verified', after)
+          denied('main write', put('main', marker, 'synthetic only\n'))
+          for prefix in ('heads/', 'tags/'):
+              name = prefix + 'synthetic-access-check'
+              assert call('GET','git/ref/' + name)[0] == 404
+              denied(name, call('POST','git/refs',{'ref':'refs/' + name,'sha':main}))
+              assert call('GET','git/ref/' + name)[0] == 404
+          candidate = 'name: Synthetic inert probe\non: workflow_dispatch\npermissions: {}\njobs:\n  check:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo synthetic\n'
+          path = '.github/workflows/synthetic-access-check.yml'
+          denied('workflow creation on Data', put('transport-state', path, candidate))
+          assert call('GET', 'contents/' + path + '?ref=transport-state')[0] == 404
+          assert ref('heads/main') == main and ref('heads/transport-state') == after
+          print('final refs verified', main, after)
